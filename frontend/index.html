@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>4 Chat</title>
+</head>
+<body>
+<h2>4 Chat</h2>
+
+<div id="auth">
+  <h3>Login</h3>
+  <input id="username" placeholder="Username">
+  <input id="password" placeholder="Password" type="password">
+  <button onclick="login()">Login</button>
+</div>
+
+<div id="chat" style="display:none;">
+  <h3>Chat</h3>
+  <input id="recipient" placeholder="Recipient public ID">
+  <div id="messages" style="border:1px solid #ccc;height:200px;overflow-y:auto;margin:10px 0;padding:5px;"></div>
+  <input id="newMsg" placeholder="Type message">
+  <button onclick="sendMessage()">Send</button>
+  <button onclick="logout()">Logout</button>
+</div>
+
+<script>
+let token = '';
+let myId = null;
+
+async function login() {
+  const formData = new URLSearchParams();
+  formData.append('username', document.getElementById('username').value);
+  formData.append('password', document.getElementById('password').value);
+
+  const res = await fetch('http://127.0.0.1:8000/login', {
+    method: 'POST',
+    body: formData
+  });
+  const data = await res.json();
+  token = data.access_token;
+
+  const meRes = await fetch('http://127.0.0.1:8000/users/me', {
+    headers: { 'Authorization': 'Bearer ' + token }
+  });
+  const me = await meRes.json();
+  myId = me.id;
+
+  document.getElementById('auth').style.display = 'none';
+  document.getElementById('chat').style.display = 'block';
+}
+
+async function loadMessages() {
+  const recipient = document.getElementById('recipient').value;
+  if (!recipient) return;
+  const res = await fetch(`http://127.0.0.1:8000/chat/${recipient}`, {
+    headers: { 'Authorization': 'Bearer ' + token }
+  });
+  const msgs = await res.json();
+  const div = document.getElementById('messages');
+  div.innerHTML = msgs.map(m => `<b>${m.sender_id===myId?'Me':'Them'}:</b> ${m.content}`).join('<br>');
+}
+
+async function sendMessage() {
+  const recipient = document.getElementById('recipient').value;
+  const content = document.getElementById('newMsg').value;
+  if (!recipient || !content) return;
+
+  await fetch(`http://127.0.0.1:8000/chat/${recipient}/send`, {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + token, 'Content-Type':'application/json' },
+    body: JSON.stringify({ content })
+  });
+  document.getElementById('newMsg').value = '';
+  await loadMessages();
+}
+
+function logout() {
+  token = '';
+  myId = null;
+  document.getElementById('auth').style.display = 'block';
+  document.getElementById('chat').style.display = 'none';
+}
+
+// автообновление сообщений каждые 2 сек
+setInterval(loadMessages, 2000);
+</script>
+</body>
+</html>

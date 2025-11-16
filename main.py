@@ -1,15 +1,21 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
+
+#from websocket_router import router as ws_router
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from jose import jwt, JWTError
 from config import settings
 from auth import verify_password
+from sqlalchemy import select
 
+from crud import create_message, get_or_create_private_chat, get_user_chats_by_public_id, get_chat_messages 
 from init_db import init_db
 from db_conf import get_db
-from crud import get_all_users, get_user_by_id, create_user, delete_user, get_messages_between, create_message
+from crud import get_all_users, get_user_by_id, get_user_by_public_id, create_user, delete_user, get_messages_between
 from crud import get_refresh_tokens_by_user
+from crud import save_refresh_token_hash
 from crud import revoke_user_refresh_tokens
 from models import UserCreate, MessageCreate, UserRead, MessageRead
 from auth import (
@@ -20,11 +26,25 @@ from auth import (
     hash_password,
     check_rate_limit
 )
-from db_models import User
+from db_models import User, Message
 
 
 
 app = FastAPI(title="Welcome to the chat buddy...")
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # или ["http://localhost:5500"] если хочешь ограничить
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    )
+
+
+
+#app.include_router(ws_router)
+
 
 
 @app.on_event("startup")
@@ -33,9 +53,15 @@ async def on_startup():
 
 
 
+@app.get("/")
+def main_page():
+    return "welcome"
+
+
+
 # ---------------- AUTH ----------------
 
-@app.post("/register")
+@app.post("/auth/register")
 async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
     """Регистрация нового пользователя"""
     user.password = hash_password(user.password)
@@ -61,7 +87,11 @@ async def login(
 
 
     access_token = create_access_token(data={"sub": user.username})
-    refresh_token = create_refresh_token(data={"sub": user.username})  # убрали db и await
+    refresh_token = create_refresh_token(data={"sub": user.username})
+    
+    # Сохраняем хэш в БД
+    refresh_token_hash = hash_password(refresh_token)
+    await save_refresh_token_hash(db, user.id, refresh_token_hash)
 
     return {
         "access_token": access_token,
@@ -71,26 +101,24 @@ async def login(
 
 
 @app.post("/refresh")
-async def refresh_token_endpoint(refresh_token: str, db: AsyncSession = Depends(get_db)):
-    """
-    Обновление access_token по refresh_token
-    (если refresh валиден и не отозван)
-    """
-    #from jose import jwt, JWTError
-    #from config import settings
-    #from auth import verify_password
-
+async def refresh_token_endpoint(
+    refresh_token: str,
+    db: AsyncSession = Depends(get_db)
+):
     try:
-        payload = jwt.decode(refresh_token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        payload = jwt.decode(
+            refresh_token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM]
+        )
         username: str | None = payload.get("sub")
         token_type = payload.get("type")
+
         if username is None or token_type != "refresh":
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    # Проверка в БД — существует ли этот refresh (по хэшу)
-    #from crud import get_refresh_tokens_by_user
     user_tokens = await get_refresh_tokens_by_user(db, username)
     valid = False
     for t in user_tokens:
@@ -139,31 +167,78 @@ async def read_user_by_id(user_id: int, db: AsyncSession = Depends(get_db)):
 # ---------------- chat & messages ----------------
 
 
-@app.post("/chat", response_model=MessageRead)
+#Найти пользователя по публичному айди
+@app.get("/users/public/{public_id}", response_model=UserRead)
+async def find_user_by_public_id(public_id: str, db: AsyncSession = Depends(get_db)):
+    user = await get_user_by_public_id(db, public_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+
+#Написать пользователю
+@app.post("/chat/{public_id}/send", response_model=MessageRead)
 async def send_message(
+    public_id: str,
     message: MessageCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Отправить сообщение другому пользователю"""
-    if message.recipient_id == current_user.id:
+
+    if public_id == current_user.public_id:
         raise HTTPException(status_code=400, detail="Cannot send message to yourself")
 
-    msg = await create_message(db, message, current_user.id)
+    """Отправить сообщение другому пользователю"""
+    recipient = await get_user_by_public_id(db, public_id)
+    if not recipient:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+
+
+    chat = await get_or_create_private_chat(db=db, user1_id=current_user.id, user2_id=recipient.id)
+
+    msg = await create_message(
+        db=db,
+        sender_public=current_user.public_id,
+        recipient_public=recipient.public_id,
+        content=message.content
+    )
+
     return msg
 
 
 
-
-@app.get("/chat/{other_user_id}", response_model=list[MessageRead])
+#Получить историю чата с другим пользователем
+@app.get("/chat/{public_id}", response_model=list[MessageRead])
 async def get_chat_messages(
-    other_user_id: int,
+    public_id: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
+
     """Получить историю сообщений с другим пользователем"""
-    messages = await get_messages_between(db, current_user.id, other_user_id)
+    recipient = await get_user_by_public_id(db, public_id)
+    if not recipient:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if recipient.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot get chat with yourself")
+
+
+    chat = await get_or_create_private_chat(db=db, user1_id=current_user.id, user2_id=recipient.id)
+
+
+    # Получаем все сообщения чата
+    result = await db.execute(
+        select(Message)
+        .where(Message.chat_id == chat.id)
+        .order_by(Message.created_at)
+    )
+
+    messages = result.scalars().all()
+
     return messages
+
 
 
 

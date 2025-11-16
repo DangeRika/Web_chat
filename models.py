@@ -11,6 +11,7 @@ class UserCreate(UserBase):
 
 class UserRead(UserBase):
     id: int
+    public_id: str
     is_admin: bool
 
     class Config:
@@ -22,7 +23,6 @@ class MessageBase(BaseModel):
     content: str
 
 class MessageCreate(MessageBase):
-    recipient_id: int
     content: str
 
 class MessageRead(MessageBase):
