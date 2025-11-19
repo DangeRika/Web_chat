@@ -4,6 +4,8 @@ from db_models import User, Message, Chat, ChatMember
 from models import UserCreate, MessageCreate
 from fastapi import HTTPException
 from sqlalchemy import func, desc
+from security import verify_user_access
+from fastapi import Depends
 
 # ---------------- Users ----------------
 
@@ -134,22 +136,39 @@ async def get_or_create_private_chat(db, user1_id, user2_id):
 
 
 # Получить список чатов пользователя
-async def get_user_chats_by_public_id(db: AsyncSession, user_public_id: str) -> list[Chat]:
-    # сначала ищем пользователя по public_id
+async def get_current_user_chats_by_public_id(db: AsyncSession, user: User = Depends(verify_user_access)) -> list[dict]:
+    """
+    Получить список чатов текущего пользователя с собеседниками.
+    user — уже проверенный через verify_user_access
+    """
+    # Получаем чаты, исключая самого пользователя
     result = await db.execute(
-        select(User).where(User.public_id == user_public_id)
+        select(
+            Chat.id,
+            Chat.created_at,
+            User.id.label("peer_id"),
+            User.username.label("peer_username"),
+            User.public_id.label("peer_public_id")  # добавляем public_id
+        )
+        .join(ChatMember, Chat.id == ChatMember.chat_id)
+        .join(User, User.id == ChatMember.user_id)
+        .where(ChatMember.user_id != user.id)
+        .where(Chat.id.in_(
+            select(ChatMember.chat_id).where(ChatMember.user_id == user.id)
+        ))
     )
-    user = result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # теперь получаем его чаты
-    result = await db.execute(
-        select(Chat)
-        .join(ChatMember)
-        .where(ChatMember.user_id == user.id)
-    )
-    return result.scalars().all()
+
+    return [
+        {
+            "chat_id": row.id,
+            "created_at": row.created_at,
+            "peer_id": row.peer_id,
+            "peer_username": row.peer_username,
+            "peer_public_id": row.peer_public_id  # возвращаем public_id
+        }
+        for row in result
+    ]
+
 
 
 

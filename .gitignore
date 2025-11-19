@@ -3,3 +3,4 @@ docker-compose.yaml
 __pycache__/
 *.pyc
 config.py
+plan_for_work.md

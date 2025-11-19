@@ -8,16 +8,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from jose import jwt, JWTError
 from config import settings
 from auth import verify_password
+from security import verify_user_access 
 from sqlalchemy import select
+from typing import List
 
-from crud import create_message, get_or_create_private_chat, get_user_chats_by_public_id, get_chat_messages 
+from crud import create_message, get_or_create_private_chat, get_chat_messages 
 from init_db import init_db
 from db_conf import get_db
+from crud import get_current_user_chats_by_public_id
 from crud import get_all_users, get_user_by_id, get_user_by_public_id, create_user, delete_user, get_messages_between
 from crud import get_refresh_tokens_by_user
 from crud import save_refresh_token_hash
 from crud import revoke_user_refresh_tokens
-from models import UserCreate, MessageCreate, UserRead, MessageRead
+from models import UserCreate, MessageCreate, UserRead, MessageRead, NewMessageRead, UserIsAdminRead
 from auth import (
     auth_user,
     get_current_user,
@@ -56,6 +59,36 @@ async def on_startup():
 @app.get("/")
 def main_page():
     return "welcome"
+
+
+
+
+
+
+
+
+
+# ----------- -- For Admin -----------
+
+def admin_check(current_user: User = Depends(get_current_user)) -> User:
+    if not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+    return current_user
+
+
+
+
+
+@app.get("/users", response_model=list[UserIsAdminRead])
+async def read_all_users(db: AsyncSession = Depends(get_db), current_user: User = Depends(admin_check)):
+    """Список всех пользователей (только для администратора)"""
+    return await get_all_users(db)
+
+
+
 
 
 
@@ -100,11 +133,22 @@ async def login(
     }
 
 
+
+@app.post("/logout")
+async def logout(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Выход — удаляем все refresh токены пользователя"""
+    #from crud import revoke_user_refresh_tokens
+    await revoke_user_refresh_tokens(db, current_user.id)
+    return {"detail": "Logged out successfully"}
+
+
+
 @app.post("/refresh")
 async def refresh_token_endpoint(
     refresh_token: str,
     db: AsyncSession = Depends(get_db)
 ):
+    # -------- ДЕКОДИРОВАНИЕ JWT --------
     try:
         payload = jwt.decode(
             refresh_token,
@@ -115,56 +159,72 @@ async def refresh_token_endpoint(
         token_type = payload.get("type")
 
         if username is None or token_type != "refresh":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Invalid token")
+
     except JWTError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    user_tokens = await get_refresh_tokens_by_user(db, username)
-    valid = False
-    for t in user_tokens:
-        if verify_password(refresh_token, t.token_hash):
-            valid = True
+    # -------- ПРОВЕРКА В БД --------
+    stored_tokens = await get_refresh_tokens_by_user(db, username)
+
+    matched_token = None
+    for t in stored_tokens:
+        if verify_password(refresh_token, t.token_hash):  # bcrypt сравнение
+            matched_token = t
             break
-    if not valid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
 
-    new_access_token = create_access_token(data={"sub": username})
-    return {"access_token": new_access_token, "token_type": "bearer"}
+    if not matched_token:
+        raise HTTPException(status_code=401, detail="Token revoked")
+
+    # -------- РОТАЦИЯ REFRESH TOKEN --------
+    # Удаляем старый записанный токен
+    await delete_refresh_token(db, matched_token.id)
+
+    # Создаем новый refresh и access токены
+    new_access = create_access_token({"sub": username})
+    new_refresh = create_refresh_token({"sub": username})
+
+    # Записываем новый refresh token (только hash!)
+    await store_refresh_token(
+        db=db,
+        username=username,
+        token_hash=hash_password(new_refresh)
+    )
+
+    # -------- ОТДАЕМ НОВЫЕ ТОКЕНЫ --------
+    return {
+        "access_token": new_access,
+        "refresh_token": new_refresh,
+        "token_type": "bearer"
+    }
 
 
-@app.post("/logout")
-async def logout(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """Выход — удаляем все refresh токены пользователя"""
-    #from crud import revoke_user_refresh_tokens
-    await revoke_user_refresh_tokens(db, current_user.id)
-    return {"detail": "Logged out successfully"}
 
 
 # ---------------- USERS ----------------
 
-@app.get("/users", response_model=list[UserRead])
-async def read_all_users(db: AsyncSession = Depends(get_db)):
-    """Список всех пользователей (только для администратора в будущем)"""
-    return await get_all_users(db)
 
 
-@app.get("/users/me", response_model=UserRead)
+#Профиль пользователя
+@app.get("/user/profile/me", response_model=UserRead)
 async def get_me(current_user: User = Depends(get_current_user)):
     """Получаем информацию о текущем пользователе"""
     return current_user
 
 
-@app.get("/users/to/{user_id}", response_model=UserRead)
-async def read_user_by_id(user_id: int, db: AsyncSession = Depends(get_db)):
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
-
-
-
 
 # ---------------- chat & messages ----------------
+
+
+
+@app.get("/chat/list")
+async def get_chats_list(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    chats = await get_current_user_chats_by_public_id(db=db, user=current_user)
+    return chats
+
 
 
 #Найти пользователя по публичному айди
@@ -177,75 +237,63 @@ async def find_user_by_public_id(public_id: str, db: AsyncSession = Depends(get_
 
 
 
-#Написать пользователю
-@app.post("/chat/{public_id}/send", response_model=MessageRead)
-async def send_message(
-    public_id: str,
-    message: MessageCreate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-
-    if public_id == current_user.public_id:
-        raise HTTPException(status_code=400, detail="Cannot send message to yourself")
-
-    """Отправить сообщение другому пользователю"""
-    recipient = await get_user_by_public_id(db, public_id)
-    if not recipient:
-        raise HTTPException(status_code=404, detail="Recipient not found")
-
-
-    chat = await get_or_create_private_chat(db=db, user1_id=current_user.id, user2_id=recipient.id)
-
-    msg = await create_message(
-        db=db,
-        sender_public=current_user.public_id,
-        recipient_public=recipient.public_id,
-        content=message.content
-    )
-
-    return msg
-
-
-
 #Получить историю чата с другим пользователем
-@app.get("/chat/{public_id}", response_model=list[MessageRead])
-async def get_chat_messages(
+@app.get("/chat/{public_id}/history", response_model=List[NewMessageRead])
+async def get_chat_history(
     public_id: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-
-    """Получить историю сообщений с другим пользователем"""
     recipient = await get_user_by_public_id(db, public_id)
     if not recipient:
         raise HTTPException(status_code=404, detail="User not found")
-
     if recipient.id == current_user.id:
-        raise HTTPException(status_code=400, detail="Cannot get chat with yourself")
-
+        raise HTTPException(status_code=400, detail="Cannot chat with yourself")
 
     chat = await get_or_create_private_chat(db=db, user1_id=current_user.id, user2_id=recipient.id)
 
-
-    # Получаем все сообщения чата
-    result = await db.execute(
-        select(Message)
+    stmt = (
+        select(Message, User.username, User.public_id)
+        .join(User, Message.sender_id == User.id)
         .where(Message.chat_id == chat.id)
         .order_by(Message.created_at)
     )
+    result = await db.execute(stmt)
+    rows = result.all()
 
-    messages = result.scalars().all()
+    messages = []    
+    for msg, sender_username, sender_public_id in rows:
+        if msg.sender_id == current_user.id:
+            recipient_user = recipient
+        else:
+            recipient_user = current_user
+
+        messages.append({
+            "id": msg.id,
+            "chat_id": msg.chat_id,
+            "sender_id": msg.sender_id,
+            "content": msg.content,
+            "created_at": msg.created_at,
+            "sender_username": sender_username,
+            "sender_public_id": sender_public_id,
+            "recipient_username": recipient_user.username,
+            "recipient_public_id": recipient_user.public_id,
+        })
 
     return messages
 
 
 
 
+# IN WORK..........
+#Написать пользователю
+#Через вебсокет
+#@app.post("/chat/{public_id}/send", response_model=MessageRead)
+#пОЛУЧИТЬ СООБЩЕНИЯ от пользователя
+#Через вебсокет
 
 
-
-
+#статусы онлайн/офлайн
 
 
 
