@@ -35,7 +35,7 @@ async def get_all_users(db: AsyncSession) -> list[User]:
 
 # При регистрации тока 
 async def create_user(db: AsyncSession, user: UserCreate) -> User:
-    db_user = User(**user.dict())
+    db_user = User(**user.model_dump())
     db.add(db_user)
     await db.commit()
     await db.refresh(db_user)

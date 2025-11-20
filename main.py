@@ -1,6 +1,7 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Query
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
 
 #from websocket_router import router as ws_router
 
@@ -10,7 +11,7 @@ from config import settings
 from auth import verify_password
 from security import verify_user_access 
 from sqlalchemy import select
-from typing import List
+from typing import List, Optional
 
 from crud import create_message, get_or_create_private_chat, get_chat_messages 
 from init_db import init_db
@@ -20,7 +21,7 @@ from crud import get_all_users, get_user_by_id, get_user_by_public_id, create_us
 from crud import get_refresh_tokens_by_user
 from crud import save_refresh_token_hash
 from crud import revoke_user_refresh_tokens
-from models import UserCreate, MessageCreate, UserRead, MessageRead, NewMessageRead, UserIsAdminRead
+from models import UserCreate, MessageCreate, UserRead, MessageRead, NewMessageRead, UserIsAdminRead, UserUpdate
 from auth import (
     auth_user,
     get_current_user,
@@ -63,11 +64,6 @@ def main_page():
 
 
 
-
-
-
-
-
 # ----------- -- For Admin -----------
 
 def admin_check(current_user: User = Depends(get_current_user)) -> User:
@@ -82,7 +78,7 @@ def admin_check(current_user: User = Depends(get_current_user)) -> User:
 
 
 
-@app.get("/users", response_model=list[UserIsAdminRead])
+@app.get("/admin/users", tags=["Admin"], response_model=list[UserIsAdminRead])
 async def read_all_users(db: AsyncSession = Depends(get_db), current_user: User = Depends(admin_check)):
     """Список всех пользователей (только для администратора)"""
     return await get_all_users(db)
@@ -94,7 +90,7 @@ async def read_all_users(db: AsyncSession = Depends(get_db), current_user: User 
 
 # ---------------- AUTH ----------------
 
-@app.post("/auth/register")
+@app.post("/auth/register", tags=["Auth"])
 async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
     """Регистрация нового пользователя"""
     user.password = hash_password(user.password)
@@ -102,7 +98,7 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
     return db_user
 
 
-@app.post("/login")
+@app.post("/auth/login", tags=["Auth"])
 async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db)
@@ -117,7 +113,12 @@ async def login(
             status_code=401,
             detail="Incorrect username or password"
         )
-
+        
+    user.is_online = True
+    user.last_active = datetime.utcnow()
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
 
     access_token = create_access_token(data={"sub": user.username})
     refresh_token = create_refresh_token(data={"sub": user.username})
@@ -125,7 +126,7 @@ async def login(
     # Сохраняем хэш в БД
     refresh_token_hash = hash_password(refresh_token)
     await save_refresh_token_hash(db, user.id, refresh_token_hash)
-
+    
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -133,13 +134,19 @@ async def login(
     }
 
 
-
-@app.post("/logout")
+@app.post("/auth/logout", tags=["Auth"])
 async def logout(current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """Выход — удаляем все refresh токены пользователя"""
     #from crud import revoke_user_refresh_tokens
+    current_user.is_online = False
+    current_user.last_active = datetime.utcnow()
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+    
     await revoke_user_refresh_tokens(db, current_user.id)
     return {"detail": "Logged out successfully"}
+
 
 
 
@@ -206,10 +213,59 @@ async def refresh_token_endpoint(
 
 
 #Профиль пользователя
-@app.get("/user/profile/me", response_model=UserRead)
-async def get_me(current_user: User = Depends(get_current_user)):
+@app.get("/user/profile/me", tags=["User"])
+async def get_me(
+    current_user: User = Depends(get_current_user), 
+    ):
+
     """Получаем информацию о текущем пользователе"""
-    return current_user
+    
+    user = UserRead.model_validate(current_user)
+    return user.model_dump(exclude_none=True)
+
+
+
+@app.patch("/user/profile/me", tags=["User"])
+async def update_me(
+    user_update: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+
+    update_data = user_update.model_dump(exclude_unset=True)
+
+    # Обновляем
+    for key, value in update_data.items():
+        setattr(current_user, key, value)
+
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+
+    user = UserRead.model_validate(current_user)
+    return user.model_dump(exclude_none=True)
+
+
+
+
+#Найти пользователя по публичному айди
+@app.get("/user/public/{public_id}", tags=["User"], response_model=UserRead)
+async def find_user_by_public_id(public_id: str, db: AsyncSession = Depends(get_db)):
+    user = await get_user_by_public_id(db, public_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+
+@app.get("/user/{public_id}/status", tags=["User"])
+async def get_user_status(public_id: str, db: AsyncSession = Depends(get_db)):
+    user = await get_user_by_public_id(db, public_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"public_id": user.public_id, "is_online": user.is_online}
+
+
 
 
 
@@ -217,7 +273,7 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 
 
-@app.get("/chat/list")
+@app.get("/chat/list", tags=["Chat"])
 async def get_chats_list(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -227,18 +283,8 @@ async def get_chats_list(
 
 
 
-#Найти пользователя по публичному айди
-@app.get("/users/public/{public_id}", response_model=UserRead)
-async def find_user_by_public_id(public_id: str, db: AsyncSession = Depends(get_db)):
-    user = await get_user_by_public_id(db, public_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
-
-
-
 #Получить историю чата с другим пользователем
-@app.get("/chat/{public_id}/history", response_model=List[NewMessageRead])
+@app.get("/chat/{public_id}/history", tags=["Chat"], response_model=List[NewMessageRead])
 async def get_chat_history(
     public_id: str,
     current_user: User = Depends(get_current_user),

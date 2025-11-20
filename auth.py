@@ -3,7 +3,8 @@ from sqlalchemy import select
 from datetime import datetime, timedelta, timezone
 from time import time
 from typing import Optional
-from jose import JWTError, jwt
+from jose import jwt
+from jose.exceptions import ExpiredSignatureError, JWTError
 from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -45,7 +46,7 @@ async def check_rate_limit(username: str):
 
 #config
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
 
 
@@ -102,21 +103,32 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession
 
         if username is None or token_type != "access":
             raise credentials_exception
-        token_data = TokenData(username=username, type=token_type)
+        token_data = TokenData(
+            username=username, 
+            type=token_type
+        )
+
+        if not username or token_type != "access":
+             raise credentials_exception
+
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Access token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     except JWTError:
-        raise credentials_exception
+        raise credentials_exception    
 
     user = await get_user_by_username(db, token_data.username)
-    if user is None:
+
+    if not user:
         raise credentials_exception
     return user
     
 
 
-async def get_current_active_user(current_user: User = Depends(get_current_user)):
-    if current_user.disabled:
-        raise HTTPException(status_code=400, detail="Inactive user")
-    return current_user
 
 
 

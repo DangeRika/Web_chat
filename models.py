@@ -1,5 +1,7 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, Field
 from datetime import datetime
+from typing import Optional 
+from sqlalchemy import DateTime
 
 
 # ------------------- USERS -------------------
@@ -11,6 +13,26 @@ class UserCreate(UserBase):
 
 class UserRead(UserBase):
     public_id: str
+    #avatar: 
+    description: Optional[str] = None
+
+
+    model_config = {
+            "from_attributes": True,
+            "extra": "ignore",
+            "populate_by_name": True
+        }
+    
+    @field_validator("description", mode="before")
+    def empty_to_none(cls, v):
+        if v == "" or v is None:
+            return None
+        return v
+    
+    
+class UserUpdate(BaseModel):
+    #username: Optional[str] = Field(None, min_length=1)
+    description: Optional[str] = None
 
     class Config:
         orm_mode = True

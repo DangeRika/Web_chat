@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, T
 from sqlalchemy.orm import relationship
 from db_conf import Base
 import secrets
+from datetime import datetime
 
 #-------------------
 # users
@@ -16,8 +17,11 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     public_id = Column(String, unique=True, index=True, default=generate_public_id)
     username = Column(String, unique=True, index=True, nullable=False)
+    description = Column(String, nullable=True, default=None)
     password = Column(String, nullable=False)  # потом будем хранить хэш
     is_admin = Column(Boolean, default=False)
+    is_online = Column(Boolean, default=False)
+    last_active = Column(DateTime)
 
     # связь "один ко многим" с сообщениями
     sent_messages = relationship("Message", back_populates="sender", foreign_keys='Message.sender_id')
